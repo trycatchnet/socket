@@ -74,10 +74,10 @@ int main() {
         printf("got connection from : %s\n", s);
         char msg[] = "popomda\n";
         if (read(newfd, buf, sizeof(buf)) == -1) {
-            perror("read");
+          perror("read");
         }
         if (send(newfd, msg, sizeof(msg) + 1, 0) == -1) {
-            perror("send");
+          perror("send");
         }
         close(newfd);
     }
