@@ -1,6 +1,6 @@
-#include <asm-generic/socket.h>
-#include <stddef.h>
 #define _GNU_SOURCE
+
+#include <stddef.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +40,7 @@
 
 #define MAX_BUFFER_SIZE   1500
 #define PUNCH_INTERVAL_MS 300
+#define PUNCH_TIMEOUT_MS  30000
 #define PING_INTERVAL_MS  1000
 #define PING_TIMEOUT_MS   2000
 
@@ -274,7 +275,7 @@ static int stun_discover(int sock_fd, const char *stun_host, uint16_t stun_port,
     struct sockaddr_in stun_addr = {0};
     stun_addr.sin_family = AF_INET;
 
-    if (inet_pton(AF_INET, stun_host, &stun_addr.sin_family) <= 0) {
+    if (inet_pton(AF_INET, stun_host, &stun_addr.sin_addr) <= 0) {
         if (resolve_hostname(stun_host, &stun_addr) < 0) {
             fprintf(stderr, "[ERR] STUN server not resolved: %s\n", stun_host);
             return -1;
@@ -332,7 +333,7 @@ static int stun_discover(int sock_fd, const char *stun_host, uint16_t stun_port,
             continue;
 
         // 0x0101 = Binding Success Response
-        if (req.msg_type != 0x0101)
+        if (resp.msg_type != 0x0101)
             continue;
 
         // make sure the response is for the request we just sent
@@ -366,4 +367,774 @@ static int stun_discover(int sock_fd, const char *stun_host, uint16_t stun_port,
 
     fprintf(stderr, "[ERR] STUN discovery %d, test is failed.\n", STUN_MAX_ATTEMPTS);
     return -1;
+}
+
+/* Custom p2p ping wire protocol we are using a custom hexadecimal value.
+* The main reason is confirm that the udp packet that we listen is from this specific program. */
+
+/*
+*   P2P_MAGIC :
+*   0x50 = P
+*   0x32 = 2
+ *  0x50 = P
+ *  0x43 = C
+ * */
+#define P2P_MAGIC 0x50325043u
+/* magic -> 4 bytes, type -> 1 byte, seq -> 4 bytes, ts_us -> 8 bytes
+ * if you get it all together it's 17 bytes */
+#define P2P_PACKET_SIZE 17
+
+/* Custom packet types for this program.
+ * 
+ * MSG_PUNCH : Packet is currently on NAT punching.
+ * MSG_PING : Start ping.
+ * MSG_PONG : Response for the coming ping, sends the exact seq and timestamp.
+ * MSG_BYE : Tells us that the peer we connected is exiting.
+ * */
+
+enum { MSG_PUNCH = 1, MSG_PING = 2, MSG_PONG = 3, MSG_BYE = 4};
+
+/* P2P Packet structure
+ *
+ * Note :
+ * You can't directly send this structure through network.
+ * Because the compiler can add padding or the numbres can be hold in different byte orders.
+ *
+ * To prevent that, we are using custom functions, p2p_pack() and p2p_unpack() */
+
+typedef struct {
+    uint32_t magic; /* P2P_MAGIC verification value */
+    uint8_t type; /* MSG_PUNCH, MSG_PING etc. */
+    uint32_t seq; /* Sequence number, obviously */
+    uint64_t ts_us; /* Transmission/send time, in microseconds */
+} p2p_packet_t;
+
+/* Convert the p2p_packet_t struct to exact 17 byte wire format. */
+static int p2p_pack(const p2p_packet_t *pkt, uint8_t *buf, size_t buf_len) {
+    if (buf_len < P2P_PACKET_SIZE) return -1;
+
+    /* convert 32 bit values into network byte order */ 
+    uint32_t magic_be = htonl(pkt->magic);
+    uint32_t seq_be = htonl(pkt->seq);
+    
+    /* htobe64
+     * Convert 64 bit timestamp onto big-endian format */
+    uint64_t ts_be = htobe64(pkt->ts_us);
+
+    /* wire byte layout */
+    memcpy(buf, &magic_be, 4); // byte 0-3 
+    buf[4] = pkt->type; // byte 4 only
+    memcpy(buf + 5, &seq_be, 4); // byte 5-8
+    memcpy(buf + 9, &ts_be, 8); // byte 9-16
+
+    return P2P_PACKET_SIZE;
+}
+
+
+/* Unconvert the p2p_packet_t struct. */
+static int p2p_unpack(const uint8_t *buf, size_t len, p2p_packet_t *pkt) {
+    if (len < P2P_PACKET_SIZE) return -1;
+
+    /* temporary variables for network byte order */
+    uint32_t magic_be;
+    uint32_t seq_be;
+    uint64_t ts_be;
+
+    /* reads wire format fields */
+    memcpy(&magic_be, buf, 4);
+    pkt->type = buf[4];
+    memcpy(&seq_be, buf + 5, 4);
+    memcpy(&ts_be, buf + 9, 8);
+
+    /* convert to host byte order */
+    pkt->magic = ntohl(magic_be);
+    pkt->seq = ntohl(seq_be);
+    pkt->ts_us = be64toh(ts_be);
+
+    /* If magic isn't the correct value, it's not belong to this program. */
+    if (pkt->magic != P2P_MAGIC) return -1;
+
+    return 0;
+}
+
+/* p2p_send 
+ * Creates p2p packet fields, converts onto binary wire format then sends to target with udp */
+static int p2p_send(int sock_fd, const struct sockaddr_in *dst, uint8_t type, uint32_t seq, uint64_t ts_us) {
+    p2p_packet_t pkt = {
+        P2P_MAGIC,
+        type,
+        seq,
+        ts_us
+    };
+
+    uint8_t buf[P2P_PACKET_SIZE];
+
+    int len = p2p_pack(&pkt, buf, sizeof(buf));
+    if (len < 0) return -1;
+
+    return (int)sendto(sock_fd, buf, (size_t)len, 0, (const struct sockaddr*)dst, sizeof(*dst));
+}
+
+/* now_us
+ * CLOCK_MONOTONIC based microsecond converter.
+ * It converts the current time into microseconds
+ *
+ * CLOCK_MONOTONIC:
+ * - While the program is running, goes back and forth.
+ * - If the system or the user changes system clock, it wouldn't get borked.
+ * - It is more safe than CLOCK_REALTIME for calculating RTT, timeout and intervals. 
+ *
+ * ts_us :
+ * ts -> timestamp
+ * us -> microseconds (the u comes from mu in greek)
+ */
+
+static uint64_t now_us(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+/* now_ms
+ * Returns the same time as milliseconds
+ *
+ * now_us returns microseconds so we can divide the result to 1000 for milliseconds.
+ * 1 microseconds = 1000 milliseconds */
+
+static uint64_t now_ms(void) {
+    return now_us() / 1000ULL;
+}
+
+/* addr_equal()
+ *
+ * It cheks if a sockaddr_in address is the same in both ipv4 and port.
+ *
+ * Why ?
+ * - UDP socket can have different packages from the internet.
+ * - We need to process only the packages from waiting peer.
+ *
+ * sin_port is in network byte order.
+ * sin_addr.s_addr is in network byte order too.
+ *
+ * Because of that reason we can check directly without conversion.
+ * */
+
+static int addr_equal(const struct sockaddr_in *a, const struct sockaddr_in *b) {
+    return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
+}
+
+/* Global stop flag for CTRL+C
+ *
+ * volatile :
+ * Tells the compiler, this variable can be changed by a signal handler out of the program flow.
+ *
+ * sig_atomic_t :
+ * Compatible POSIX/C type for atomic access to signal handler.*/
+static volatile sig_atomic_t g_stop = 0;
+
+/* on_sigint()
+ *
+ * Executed when SIGINT signal cames.
+ * Pressing CTRL+C on a terminal generates a SIGINT signal.
+ * */
+
+static void on_sigint(int sig) {
+    (void)sig; /* not using any parameters */
+    g_stop = 1;
+}
+
+/* Step 1 : UDP Hole Punching
+ * 
+ * hole_punch() 
+ *
+ * Sends MSG_PUNCH to target peer while waiting for a interval also waits for an incoming P2P packet. 
+ *
+ * Rules:
+ * - Target peer must send UDP packet.
+ * - Packet needs valid P2P magic value.
+ * 
+ * Why we want both peers to send PUNCH at the same time ?
+ * NAT, generally creates a peer when the first UDP packet is sent inside-out.
+ * If other peers packet catches this temporary packet NAT can let peer in.
+ * */
+static int hole_punch(int sock_fd, const struct sockaddr_in *peer_addr) {
+    printf("\n[HOLE-PUNCH] Opening a hole in %s:%d address (max %d sec)...\n", inet_ntoa(peer_addr->sin_addr), ntohs(peer_addr->sin_port), PUNCH_TIMEOUT_MS / 1000);
+
+    /* Hole punch start time */
+    uint64_t start = now_ms();
+
+    /* Holds the last time we sent PUNCH packet. 
+     * It's 0 at default, we can send packet immediately. */
+    uint64_t last_sent = 0;
+
+    /* Sequence number for punch packets */
+    uint32_t seq = 0;
+
+    /* pollfd:
+     * Indicates which file descriptor and which scenario we are waiting to poll function.
+     *
+     * POLLIN = Theres info to be read.
+     * */
+
+    struct pollfd pfd = {
+        .fd = sock_fd,
+        .events = POLLIN
+    };
+
+    while (!g_stop) {
+        uint64_t t = now_ms();
+
+        /* If timeout assume it's failure */
+        if (t - start > PUNCH_TIMEOUT_MS) {
+            fprintf(stderr, "[HOLE-PUNCH] Timeout - Other peer didn't send any packets.\n" 
+                    "Possible Reason : Either one of the peer is behind SYMETRIC NAT.\n"
+                    "This case can't be resolved without any relay/TURN server.\n");
+            return -1;
+        }
+
+        /* Send package if PUNCH_INTERVAL_MS passed */
+        if (t - last_sent >= PUNCH_INTERVAL_MS) {
+            p2p_send(sock_fd, peer_addr, MSG_PUNCH, seq++, now_us());
+
+            last_sent = t;
+        }
+
+        /*
+         * Wait for packets to arrive at most POLL_SLICE_MS 
+         *
+         * poll return : 
+         * > 0 : Case happened
+         * = 0 : Timeout
+         * < 0 : Error
+         * */
+
+        int pr = poll(&pfd, 1, POLL_SLICE_MS);
+
+        /* If there's a data to read, take the packet */
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            uint8_t buf[MAX_BUFFER_SIZE];
+
+            struct sockaddr_in from;
+            socklen_t from_len = sizeof(from);
+
+            ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+
+            /* n > 0:
+             * Non-empty UDP packet came. */
+
+            if (n > 0 && addr_equal(&from, peer_addr)) {
+                p2p_packet_t pkt;
+
+                if (p2p_unpack(buf, (size_t)n, &pkt) == 0) {
+                    printf("[HOLE-PUNCH] Got package from other peer -> opened hole!\n");
+
+                    /* To increase the chance for the target peer, receive the package we send 3 extra PUNCH packet. 
+                     *
+                     * This reduceses situations where both sides don't see success at the exact time.*/
+                    for (int i = 0; i < 3; i++) {
+                        p2p_send(sock_fd, peer_addr, MSG_PUNCH, seq++, now_us());
+
+                        /* 50 ms = 50000 microseconds */
+                        usleep(50 * 1000);
+                    }
+
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /* Failed return for CTRL+C */
+    return -1;
+}
+
+/* Step 2 : Mutual Ping 
+ *
+ * ping_loop()
+ *
+ * Runs after hole punching is success.
+ *
+ * This function does 2 things at the same time :
+ * 1. Sends ping regularly to other peer.
+ * 2. If a ping came it returns PONG immediately.
+ *
+ * Because of this both sides can calculate RTT individually. */
+
+static void ping_loop(int sock_fd, const struct sockaddr_in *peer_addr) {
+    /* Peer string to print */
+    const char *peer_ip_str = inet_ntoa(peer_addr->sin_addr);
+
+    /* Host byte order port to print */
+    uint16_t peer_port = ntohs(peer_addr->sin_port);
+
+    printf("\n[PING] Mutual ping started with %s:%d (Stop with CTRL+C)\n\n", peer_ip_str, peer_port);
+
+    /* Sequence number for the next ping */
+    uint32_t seq = 0;
+
+    /* Waiting
+     * 0 = No waiting pong
+     * 1 = Waiting a pong
+     */
+    int waiting = 0;
+
+    /* Sequence number for waiting pong */
+    uint32_t waiting_seq = 0;
+
+    /* Ping sent time in monotic. */
+    uint64_t sent_at_us = 0;
+
+    /* Start time for sending the first ping immediately */
+    uint64_t next_send_ms = now_ms();
+
+    /* Stats variables
+     *
+     * sent : Targets total ping count 
+     * recvd : Successfull pong count to pings 
+     * rtt : Round-Trip-Time; Time for packets go and come
+     */
+    long sent = 0;
+    long recvd = 0;
+
+    double rtt_min = -1;
+    double rtt_max = -1;
+    double rtt_sum = 0;
+
+    struct pollfd pfd = {
+        .fd = sock_fd,
+        .events = POLLIN
+    };
+
+    while (!g_stop) {
+        uint64_t t = now_ms();
+
+        /* New ping rule:
+         * - Not waiting for upcoming pong 
+         * - Interval has came 
+         */
+
+        if (!waiting && t >= next_send_ms) {
+            seq++;
+
+            sent_at_us = now_us();
+
+            p2p_send(sock_fd, peer_addr, MSG_PING, seq, sent_at_us);
+
+            waiting = 1;
+            waiting_seq = seq;
+            sent++;
+        }
+
+        /* Pong is awaiting however if timeout passed out, we assume it's loss or timeout.
+         *
+         * sent_at_us / 1000 
+         * Microseconds to milliseconds, for making it same as t to compare*/
+        else if (waiting && (t - sent_at_us / 1000) > PING_TIMEOUT_MS) {
+            printf("Request got timeout : seq=%u\n", waiting_seq);
+
+            waiting = 0;
+
+            /* Next ping will send after timeout by PING_INTERVAL_MS */
+            next_send_ms = t + PING_INTERVAL_MS;
+        }
+
+        int pr = poll(&pfd, 1, POLL_SLICE_MS);
+
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            uint8_t buf[MAX_BUFFER_SIZE];
+
+            struct sockaddr_in from;
+            socklen_t from_len = sizeof(from);
+
+            ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+
+            /* Only process;
+             * - Not empty
+             * - Came from the waiting peer
+             * - Valid P2P formated packet */
+            if (n > 0 && addr_equal(&from, peer_addr)) {
+                p2p_packet_t pkt;
+
+                if (p2p_unpack(buf, (size_t)n, &pkt) == 0) {
+                    if (pkt.type == MSG_PING) {
+                        /*
+                         * Other peer sent PING
+                         * 
+                         * We sent pong back without changing their;
+                         * - sequence number,
+                         * - transmission timestamp 
+                         *
+                         * With this other peer can calculate their RTT with pkt.ts_us through now_us() 
+                         *
+                         * Both machines doesn't need a synchronized sync. 
+                         * The creator and calculator of the timestamp are the same peer.*/
+                        
+                        p2p_send(sock_fd, peer_addr, MSG_PONG, pkt.seq, pkt.ts_us);
+
+                        printf("[<-PING] Received %s:%d seq=%u, Sent PONG\n", peer_ip_str, peer_port, pkt.seq);
+                    }
+                    /* If incoming packet is PONG and it's our waiting sequence number we can calculate RTT */
+                    else if (pkt.type == MSG_PONG && waiting && pkt.seq == waiting_seq) {
+                        /* RTT Calculating:
+                         * Current time - Ping transmission time.
+                         *
+                         * The result is in microseconds.
+                         */
+                        double rtt_ms = (double)(now_us() - pkt.ts_us) / 1000.0;
+
+                        printf("[PONG<-] %s:%d: seq=%u time=%.2f ms\n", peer_ip_str, peer_port, pkt.seq, rtt_ms);
+
+                        recvd++;
+
+                        /* If it's first successfull RTT start minimum*/
+                        if (rtt_min < 0 || rtt_ms < rtt_min) rtt_min = rtt_ms;
+
+                        if (rtt_max < 0 || rtt_ms > rtt_max) rtt_max = rtt_ms;
+
+                        rtt_sum += rtt_ms;
+
+                        /* Got waiting pong; New ping can be sent */
+                        waiting = 0;
+
+                        next_send_ms = t + PING_INTERVAL_MS;
+                    }
+
+                    /* If the other peer exited, they send BYE */
+                    else if (pkt.type == MSG_BYE) {
+                        printf("\n[INFO] Other peer closed connection. (Got BYE)\n");
+
+                        g_stop = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("\n --- %s:%d p2p ping stats --- \n", peer_ip_str, peer_port);
+
+    /* Packet loss percentage 
+     *
+     * (sent - received) / sent * 100 
+     * 
+     * We are using a ternary opeartor to prevent dividing to 0*/
+    double loss_pct = sent > 0 ? 100.0 * (double)(sent - recvd) / (double)sent : 0.0;
+
+    /* %%%.1f inside printf :
+     * - %% means print percentage symbol as normal.
+     * - %.1f means write as floating point 
+     *
+     * Example result : "%0.0 lose" */
+    printf("%ld packet sent, %ld packet got, %%%.1f lose\n", sent, recvd, loss_pct);
+
+    if (recvd > 0) {
+        printf("rtt min/avg/max = %.2f/%.2f/%.2f ms\n", rtt_min, rtt_sum / recvd, rtt_max);
+    }
+
+    /*
+     * If program closed with CTRL+C inform other peer.
+     * NOTE : Because udp isn't safe, there's no guarantee for the packet to arrive.
+     * */
+    p2p_send(sock_fd, peer_addr, MSG_BYE, seq, now_us());
+}
+
+static void print_usage(const char *prog) {
+    fprintf(stderr, 
+            "Usage: %s <local_port> [options] [peer_ip peer_port]\n\n"
+            "Options:\n"
+            "--no-stun      Skip stun, only for local tests.\n"
+            "--stun-host HOST       Stun server (default: %s)\n"
+            "--stun-port PORT       Stun port (default: %d)\n"
+            "-h, --help     Print this message\n\n"
+            "Examples:\n"
+            "# 1) First learn your public IP:\n"
+            "%s 55000\n\n"
+            "# 2) Connect to public IP:PORT you got from other peer:\n"
+            "%s 55000 203.0.113.9 41234\n\n"
+            "# localhost test (WITHOUT STUN):\n"
+            "%s 6000 --no-stun 127.0.0.1 6601\n",
+            prog, DEFAULT_STUN_HOST, DEFAULT_STUN_PORT, prog, prog, prog);
+}
+
+/* Main program flow
+ *
+ * 1. Parse command line args.
+ * 2. Create UDP socket.
+ * 3. Bind socket with local_port that came from user.
+ * 4. Learn public address with STUN.
+ * 5. Get peer address from arg or terminal.
+ * 6. Set socket as non-blocking.
+ * 7. Do hole punching.
+ * 8. Start ping/pong loop.
+ * 9. Close socket and leave. 
+ */
+int main(int argc, char **argv) {
+    /* -h / --help can be given at any position.
+     * For that reason we scan all arguments */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { 
+            print_usage(argv[0]); return EXIT_SUCCESS; 
+        }
+    }
+
+    /* at least one argument */
+    if (argc < 2) {
+        print_usage(argv[0]); return EXIT_FAILURE;
+    }
+
+    /* atoi: Converts decimal data written as string to integer. 
+     *
+     * NOTE : Atoi can return invalid strings to 0. For that to not happen in production, strtol() must be prefered.*/
+    int local_port = atoi(argv[1]);
+
+    const char *stun_host = DEFAULT_STUN_HOST;
+    int stun_port = DEFAULT_STUN_PORT;
+
+    /* If 1 use stun 
+     * If 0 --no-stun is selected*/
+    int use_stun = 1;
+
+    /* Little array to store positional arguments that aren't options.
+     *
+     * Waited positional arguments:
+     * positional[0] = peer IP
+     * poistional[1] = peer port
+     */
+
+    char *positional[8];
+    int npos = 0;
+
+    /* argv[2] and after options can be peer info */
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--no-stun") == 0) {
+            use_stun = 0;
+        }
+        /* After --stun-host hostname/IP will be excepted. 
+         *
+         * ++i : First increments i, then uses argv[i] value.
+         * With this the option value will not get processed again. */
+        else if (strcmp(argv[i], "--stun-host") == 0 && i + 1 < argc) stun_host = argv[++i];
+        else if (strcmp(argv[i], "--stun-port") == 0 && i + 1 < argc) stun_port = atoi(argv[++i]);
+        else if (npos < 8) positional[npos++] = argv[i];
+    }
+
+    /* Peer information will be assumed as non-given default. */
+    const char *peer_ip = NULL;
+    int peer_port = -1;
+
+    /*
+     * If theres at least two positional arguments;
+     * - First is IP
+     * - Second accepted as port
+     */
+
+    if (npos >= 2) {
+        peer_ip = positional[0];
+        peer_port = atoi(positional[1]);
+    }
+
+    /* Sets stdout to line-buffered mode.
+     *
+     * Normally if stdout will be redirected to pipe/file instead of terminal, output can wait in the buffer a long time.
+     * _IOLBF flag targets flush after every line */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Start seed for rand()
+     *
+     * Time and PID gets XORed: 
+     * Decreasing the possibilities of processes that started at the same time generate the same rand() seed.*/
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+
+    /* will be called when CTRL+C pressed */
+    signal(SIGINT, on_sigint);
+    
+    /* Creates UDP IPv4 socket
+     *
+     * AF_INET:
+     * IPv4 address family
+     *
+     * SOCK_DGRAM:
+     * Datagram, UDP socket.
+     *
+     * 0:
+     * Select default protocol for this socket type and family: UDP */
+
+    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (sock_fd < 0) {
+        perror("[FATAL] socket()");
+        return EXIT_FAILURE;
+    }
+
+    /* SO_REUSEADDR:
+     * Lets you use local address over and over again.
+     *
+     * Sometimes if you close the program and reopen it with a small time gap bind can have problems.
+     * This reduceses the possibility of bind having problems.
+     */
+    int reuse = 1;
+    
+    setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    /* Getting local bind address ready, we are cleaning all fields. */
+    struct sockaddr_in local_addr = {0};
+
+    local_addr.sin_family = AF_INET;
+    /* INADDR_ANY = 0.0.0.0
+     *
+     * Accept all incoming, valid IPV4 packets.*/
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    /* Converts user-given local port to network byte order. */
+    local_addr.sin_port = htons((uint16_t)local_port);
+
+    if (bind(sock_fd, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        perror("[FATAL] bind()");
+        close(sock_fd);
+        return EXIT_FAILURE;
+    }
+
+    /* getsockname:
+     * Gets local address and local port that socket is connected.
+     *
+     * As an example if port was 0 the operating systems port was be learned.
+     */
+    socklen_t la_len = sizeof(local_addr);
+
+    getsockname(sock_fd, (struct sockaddr*)&local_addr, &la_len);
+
+    printf("Local UDP socket port : %d\n", ntohs(local_addr.sin_port));
+
+    /* INET_ADDRSTRLEN:
+     * Maximum buffer size for IPv4 text.
+     *
+     * Longest IPv4 Text : "255.255.255.255" + '\0' 
+     */
+    char public_ip[INET_ADDRSTRLEN] = {0};
+
+    /* Public port that we gonna to learn from stun */
+    uint16_t public_port = 0;
+
+    if (use_stun) {
+        printf("Discovering public address through STUN (%s:%d)...\n", stun_host, stun_port);
+
+        if (stun_discover(sock_fd, stun_host, (uint16_t)stun_port, public_ip, sizeof(public_ip), &public_port) < 0) {
+            fprintf(stderr, "[FATAL] Stun discovery failed; UDP output to internet is maybe blocking. You can do lan test with --no-stun\n");
+            close(sock_fd);
+            return EXIT_FAILURE;
+        } 
+    } else {
+        /* If there's no STUN used we can't know real public IP.
+         * This is just a placeholder for output. 
+         */
+        strncpy(public_ip, "0.0.0.0", sizeof(public_ip) - 1);
+        /* Local socket port is going to be used. */
+        public_port = ntohs(local_addr.sin_port);
+    }
+
+    printf("\n====\n");
+
+    if (use_stun) {
+        printf(" Your public address : %s:%d\n", public_ip, public_port);
+        printf(" Send this address to opposite side");
+    } else {
+        printf("Stun skipped. Send your local IP:PORT to opposite side\nExample (127.0.0.1:%d)\n", public_port);
+    }
+
+    printf("====\n");
+
+    /* Other peers IPv4 socket address */
+    struct sockaddr_in peer_addr = {0};
+
+    peer_addr.sin_family = AF_INET;
+
+    /* If peer didn't set with IP/port argument, get it from terminal interactively. */
+    if (!peer_ip) {
+        char line[128];
+
+        printf("\nEnter opposite sides public address (IP PORT), or just leave it empty and press ENTER to exit.");
+        fflush(stdout);
+        
+        /* fgets:
+         * Reads user input safely.
+         * If user only presses ENTER line[0] will become '\n'
+         */
+        if (!fgets(line, sizeof(line), stdin) || line[0] == '\n') {
+            printf("No peer address entered, exiting.\n");
+            close(sock_fd);
+            return EXIT_SUCCESS;
+        }
+
+        /* Temporary buffer for IP text */
+        char ipbuf[64];
+
+        /* The input of users port */
+        int pport;
+
+        /* sscanf:
+         * Tries to read through the line in turn targets to get an text and integer. 
+         *
+         * %63s:
+         * Maximum of 63 characters to block overflowing for ipbuf.
+         */
+        if (sscanf(line, "%63s %d", ipbuf, &pport) != 2) {
+            fprintf(stderr, "[ERR] Invalid format. Excepted: IP PORT\n");
+            close(sock_fd);
+            return EXIT_FAILURE;
+        }
+
+        /* ipbuf only will stay in memory through this if block.
+         * However peer_ip points to it, in this particular usage peer_ip gets used with inet_pton so it wouldn't occur any problems.
+         */
+        
+        peer_ip = ipbuf;
+        peer_port = pport;
+
+        /* Convert peer ip string to binary IPv4 format. */
+        if (inet_pton(AF_INET, peer_ip, &peer_addr.sin_addr) <= 0) {
+            fprintf(stderr, "[ERR] Invalid IP address: %s\n", peer_ip);
+            close(sock_fd);
+            return EXIT_FAILURE;
+        }
+    } else {
+        /* If peer ip cames from command line arguments do the same IPv4 verification. */
+        if (inet_pton(AF_INET, peer_ip, &peer_addr.sin_addr) <= 0) {
+            fprintf(stderr, "[ERR] Invalid IP address: %s\n", peer_ip);
+            close(sock_fd);
+            return EXIT_FAILURE;
+        }
+    }
+
+    /* Convert peer port to network byte order. */
+    peer_addr.sin_port = htons((uint16_t)peer_port);
+
+    /* Change socket to non-blocking mode.
+     *
+     * F_GETFL: 
+     * Reads current file status flags. 
+     *
+     * O_NONBLOCK:
+     * Let's calls like recvfrom() don't get blocked infinitely.
+     *
+     * This program doesn't waits package with directly blocking recvfrom it uses poll first.
+     */
+    int fl = fcntl(sock_fd, F_GETFL, 0);
+
+    fcntl(sock_fd, F_SETFL, fl | O_NONBLOCK);
+
+    /* First go through NAT hole punching.
+     * If it's failed, there's no point for passing to ping.
+     */
+
+    if (hole_punch(sock_fd, &peer_addr) < 0) {
+        close(sock_fd);
+        return EXIT_FAILURE;
+    }
+
+    /* If UDP transmission got directly set, start ping/pong loop */
+    ping_loop(sock_fd, &peer_addr);
+
+    close(sock_fd);
+
+    printf("\np2p_ping ended.\n");
+    return EXIT_SUCCESS;
 }
