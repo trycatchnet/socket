@@ -1,0 +1,9 @@
+# Build artifacts
+build/
+*.o
+
+# Captured STUN traffic: these carry this machine's public IP address in
+# XOR-MAPPED-ADDRESS, which is trivially reversible. Regenerate locally with
+# p2p/lab/grab.py or p2p/lab/natlab.sh + carve.py.
+p2p/lab/captures/
+p2p/stun/tests/corpus/
