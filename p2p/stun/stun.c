@@ -13,8 +13,8 @@ int stun_decode(const uint8_t *buf, size_t len, stun_msg_t *msg)
     msg->magic_cookie = (uint32_t)buf[4] << 24 | (uint32_t)buf[5] << 16 | (uint32_t)buf[6] << 8 | (uint32_t)buf[7] << 0; /* We didn't used any 0xFF in here, because we don't need to cut anything, we just need to combine shi*/
     memcpy(msg->transaction_id, buf + 8,12);
 
-    int pos = 20;
-    int limit = MIN(len, 20 + msg->msg_length);
+    size_t pos = 20;
+    size_t limit = MIN(len, (size_t)(20 + msg->msg_length));
 
     msg->attribute_count = 0;
 
@@ -55,19 +55,19 @@ int stun_encode(const stun_msg_t *msg, uint8_t *buf, size_t cap)
 
     memcpy(buf + 8, msg->transaction_id, 12);
 
-    int total_length = 0;
+    size_t total_length = 0;
 
     for (int j = 0; j < msg->attribute_count; j++) {
         total_length += 4 + ((msg->attributes[j].length + 3) & ~3);
     }
     
-    if (cap < STUN_HEADER_LEN + total_length) return -2;
+    if (cap < (size_t)(STUN_HEADER_LEN + total_length)) return -2;
 
     buf[2] = (uint8_t)(total_length >> 8);
     /* i thought why would i'll need to rewrite the resetted bottom bytes anyways. */
     buf[3] = (uint8_t)(total_length & 0xFF);
 
-    int pos = 20;
+    size_t pos = 20;
     for (int i = 0; i < msg->attribute_count; i++) {
         buf[pos + 0] = (uint8_t)(msg->attributes[i].attr_type >> 8);
         buf[pos + 1] = (uint8_t)(msg->attributes[i].attr_type & 0xFF);        
