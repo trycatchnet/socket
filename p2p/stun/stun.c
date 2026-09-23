@@ -23,6 +23,8 @@ int stun_decode(const uint8_t *buf, size_t len, stun_msg_t *msg)
         //memcpy(msg->attributes->attr_type, buf + pos + 2, 2);
         if (msg->attribute_count >= STUN_MAX_ATTRS) return -5;
         msg->attributes[msg->attribute_count].attr_type = (uint16_t)(buf[pos + 0] << 8 | buf[pos + 1]);
+        if (msg->attributes[msg->attribute_count].attr_type < 0x8000) msg->is_forced = true;
+
         msg->attributes[msg->attribute_count].length = (uint16_t)(buf[pos + 2] << 8 | buf[pos + 3]);
         if (msg->attributes[msg->attribute_count].length > limit - pos - 4) return -3; /* it may be limit tho...*/
         if (msg->attributes[msg->attribute_count].length > STUN_MAX_ATTR_VALUE) return -4;

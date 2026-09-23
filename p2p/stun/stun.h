@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #define STUN_MAGIC_COOKIE   0x2112A442u
 #define STUN_HEADER_LEN     20
@@ -27,6 +28,7 @@ typedef struct {
     uint8_t  transaction_id[12];
     stun_attr_t attributes[STUN_MAX_ATTRS];
     uint16_t attribute_count;
+    bool is_forced;
 } stun_msg_t;
 
 int stun_decode(const uint8_t *buf, size_t len, stun_msg_t *msg);

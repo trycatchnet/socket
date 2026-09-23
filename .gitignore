@@ -7,3 +7,6 @@ build/
 # p2p/lab/grab.py or p2p/lab/natlab.sh + carve.py.
 p2p/lab/captures/
 p2p/stun/tests/corpus/
+
+# Editor/LSP
+compile_commands.json

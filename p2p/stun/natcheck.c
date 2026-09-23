@@ -37,10 +37,6 @@ int main(void) {
     cloudflare.sin_addr = ((struct sockaddr_in *)servinfo->ai_addr)->sin_addr;
     freeaddrinfo(servinfo);
 
-    struct timeval tv; tv.tv_sec = 3; tv.tv_usec = 0;
-    
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval*)&tv, sizeof(struct timeval)) != 0) { perror("set socket opt"); return -4; }
-
     if (stun_query(sockfd, &google, &ip_hb, &port_hb) < 0) { perror("google stun"); return -5; }
     
     ip_nb = htonl(ip_hb);

@@ -19,8 +19,8 @@ int main(void) {
     }
 
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(19302);
-    if (inet_pton(AF_INET, "74.125.250.129", (void*)&addr.sin_addr) != 1) {
+    addr.sin_port = htons(3478);
+    if (inet_pton(AF_INET, "198.51.100.1", (void*)&addr.sin_addr) != 1) {
         perror("Inet_pton");
         return -2;
     }
@@ -34,7 +34,7 @@ int main(void) {
         return -3;
     }
    
-    stun_query(sockfd, &addr, &ip_hb, &port_hb);
+    if (stun_query(sockfd, &addr, &ip_hb, &port_hb) < 0) { printf("err stun failed."); return -4; }
     uint32_t ip_nb = htonl(ip_hb);
     char char_buf[INET_ADDRSTRLEN] = {0};
     printf("%s:%u\n", inet_ntop(AF_INET, &ip_nb, char_buf, sizeof(char_buf)), port_hb);
