@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "net.h"
 
@@ -37,7 +38,7 @@ int main(void) {
     cloudflare.sin_addr = ((struct sockaddr_in *)servinfo->ai_addr)->sin_addr;
     freeaddrinfo(servinfo);
 
-    if (stun_query(sockfd, &google, &ip_hb, &port_hb) < 0) { perror("google stun"); return -5; }
+    if (stun_query(sockfd, &google, &ip_hb, &port_hb) < 0) { fprintf(stderr, "google stun"); return -5; }
     
     ip_nb = htonl(ip_hb);
     char char_buf[INET_ADDRSTRLEN] = {0};
@@ -47,15 +48,16 @@ int main(void) {
      * */
     printf("%s:%u\n", inet_ntop(AF_INET, &ip_nb, char_buf, sizeof(char_buf)), port_hb);
     
-    if (stun_query(sockfd, &cloudflare, &ip_hb2, &port_hb2) < 0) { perror("cloudflare stun"); return -6; }
+    if (stun_query(sockfd, &cloudflare, &ip_hb2, &port_hb2) < 0) { fprintf(stderr, "cloudflare stun"); return -6; }
     ip_nb2 = htonl(ip_hb2);
     printf("%s:%u\n", inet_ntop(AF_INET, &ip_nb2, char_buf, sizeof(char_buf)), port_hb2);
 
-    if ((port_hb != port_hb2) || (ip_nb != ip_nb2)) {
+    if (port_hb != port_hb2) {
         printf("info : There's, symmetric NAT, TURN is needed.\n");
     } else {
         printf("info : There's cone NAT, hole punching is possible.\n");
-    }
+    } /* different ip's mean non-symmetric, it can be double-wan or cgnat pool. */
 
+    close(sockfd);
     return 0;
 }

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define IS_UNKNOWN_TYPE(type) ((type) != STUN_ATTR_XOR_MAPPED_ADDR && (type) != STUN_ATTR_MAPPED_ADDR)
 
 int stun_decode(const uint8_t *buf, size_t len, stun_msg_t *msg)
 {
@@ -17,13 +18,14 @@ int stun_decode(const uint8_t *buf, size_t len, stun_msg_t *msg)
     size_t limit = MIN(len, (size_t)(20 + msg->msg_length));
 
     msg->attribute_count = 0;
+    msg->is_forced = false;
 
     while (pos < limit) {
         if (limit - pos < 4) return -2;
         //memcpy(msg->attributes->attr_type, buf + pos + 2, 2);
         if (msg->attribute_count >= STUN_MAX_ATTRS) return -5;
         msg->attributes[msg->attribute_count].attr_type = (uint16_t)(buf[pos + 0] << 8 | buf[pos + 1]);
-        if (msg->attributes[msg->attribute_count].attr_type < 0x8000) msg->is_forced = true;
+        if (msg->attributes[msg->attribute_count].attr_type < 0x8000 && IS_UNKNOWN_TYPE(msg->attributes[msg->attribute_count].attr_type)) msg->is_forced = true;
 
         msg->attributes[msg->attribute_count].length = (uint16_t)(buf[pos + 2] << 8 | buf[pos + 3]);
         if (msg->attributes[msg->attribute_count].length > limit - pos - 4) return -3; /* it may be limit tho...*/
@@ -41,10 +43,8 @@ int stun_encode(const stun_msg_t *msg, uint8_t *buf, size_t cap)
     if (cap < STUN_HEADER_LEN) return -1;
     /* if cap is smaller then 20, then we ain fitting that shi */
     
-    buf[0] = (uint8_t)(msg->msg_type >> 8); /* we can get the upper byte by moving this n**** 8 bytes to right */
+    buf[0] = (uint8_t)(msg->msg_type >> 8); /* we can get the upper byte by moving this 8 bytes to right */
     buf[1] = (uint8_t)(msg->msg_type & 0xFF); /* and can get the rest(bottom dawg) with cutting the upper */
-    buf[2] = (uint8_t)(msg->msg_length >> 8);
-    buf[3] = (uint8_t)(msg->msg_length & 0xFF);
 
     /* if we'll do the below code like the upper one, it would repeat the magic cookie idk why tho */
 

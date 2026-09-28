@@ -46,23 +46,25 @@ int stun_query(int sockfd, const struct sockaddr_in *server, uint32_t *ip_host, 
     uint8_t temp_tid[12];
     memcpy(temp_tid, msg.transaction_id, 12);
   
-    uint8_t buf[STUN_MAX_MSG] = {0};
-    size_t cap = sizeof(buf);
+    uint8_t recv_buf[STUN_MAX_MSG] = {0};
+    uint8_t send_buf[STUN_MAX_MSG] = {0};
+    size_t recv_cap = sizeof(recv_buf);
+    size_t send_cap = sizeof(send_buf);
     socklen_t servlen = sizeof(*server);
 
     int timeout = STUN_RTO_DEFAULT_MS;
-    int encode_len = stun_encode(&msg, (uint8_t*)buf, cap);
-    if (encode_len < 20) { printf("err encoding"); return -2; }
+    int encode_len = stun_encode(&msg, (uint8_t*)send_buf, send_cap);
+    if (encode_len < 20) { fprintf(stderr, "err encoding | %d", encode_len); return -2; }
 
     struct pollfd r[1];
     r[0].fd = sockfd;
     r[0].events = POLLIN; 
 
     int budget = 0;
-    uint64_t first = now_ms();
     for (int i = 0; i < STUN_RC_DEFAULT; i++) {
-        fprintf(stderr, "send %d at\t %" PRIu64 "\n", i, now_ms() - first);
-        if (sendto(sockfd, buf, encode_len, 0, (struct sockaddr*)server, servlen) < 0) { perror("sendto"); }
+        // fprintf(stderr, "send %d at\t %" PRIu64 "\n", i, now_ms() - first);
+        /* the upper code was for debugging. */
+        if (sendto(sockfd, send_buf, encode_len, 0, (struct sockaddr*)server, servlen) < 0) { perror("sendto"); }
     
         if (i == STUN_RC_DEFAULT - 1) budget = STUN_RM_DEFAULT * STUN_RTO_DEFAULT_MS;
         else budget = timeout;
@@ -74,7 +76,7 @@ int stun_query(int sockfd, const struct sockaddr_in *server, uint32_t *ip_host, 
             if (remaining <= 0) break;
 
             int pollr = poll(r, 1, (int)remaining);
-            if (pollr > 0) { if (!(r[0].revents & POLLIN)) return -4; } /* .events -> is read-only for poll(), but .revents get's set from the kernel. */
+            if (pollr > 0) { if (!(r[0].revents & POLLIN)) break; } /* .events -> is read-only for poll(), but .revents get's set from the kernel. */
             if (pollr == 0) break;
             if (pollr < 0) {
                 if (errno != EINTR) return -3;
@@ -85,14 +87,15 @@ int stun_query(int sockfd, const struct sockaddr_in *server, uint32_t *ip_host, 
 
             servlen = sizeof(*server);
             
-            ssize_t recv_buf = recvfrom(sockfd, buf, cap, 0, (struct sockaddr*)&temp, &servlen);
-            if (recv_buf < 0) { perror("recvfrom"); continue;}
+            ssize_t recv_len = recvfrom(sockfd, &recv_buf, recv_cap, 0, (struct sockaddr*)&temp, &servlen);
+            if (recv_len < 0) { perror("recvfrom"); continue;}
 
-            int decode_len = stun_decode((uint8_t*)buf, recv_buf, &msg);
-            if (decode_len != 0) { printf("err decoding"); continue; }
+            int decode_len = stun_decode(recv_buf, recv_len, &msg);
+            if (decode_len != 0) { fprintf(stderr, "err decoding | %d", decode_len); continue; }
 
             if (memcmp(temp_tid, &msg.transaction_id, 12) != 0) continue;
-            if (stun_get_xor_mapped_addr(&msg, ip_host, port_host) != 0) { printf("err get xor mapped addr"); continue; } else return 0;
+            int stun_len = stun_get_xor_mapped_addr(&msg, ip_host, port_host);
+            if ( stun_len != 0) { fprintf(stderr, "err get xor mapped addr | %d", stun_len); continue; } else return 0;
         }
 
         timeout *= 2;

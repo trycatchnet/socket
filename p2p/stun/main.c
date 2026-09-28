@@ -20,20 +20,11 @@ int main(void) {
 
     addr.sin_family = AF_INET;
     addr.sin_port = htons(3478);
-    if (inet_pton(AF_INET, "198.51.100.1", (void*)&addr.sin_addr) != 1) {
+    if (inet_pton(AF_INET, "127.0.0.1", (void*)&addr.sin_addr) != 1) {
         perror("Inet_pton");
         return -2;
     }
 
-    struct timeval tv;
-    tv.tv_sec = 3;
-    tv.tv_usec = 0;
-
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval*)&tv, sizeof(struct timeval)) != 0) {
-        perror("Set socket opt");
-        return -3;
-    }
-   
     if (stun_query(sockfd, &addr, &ip_hb, &port_hb) < 0) { printf("err stun failed."); return -4; }
     uint32_t ip_nb = htonl(ip_hb);
     char char_buf[INET_ADDRSTRLEN] = {0};
